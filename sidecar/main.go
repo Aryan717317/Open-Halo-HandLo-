@@ -27,6 +27,13 @@ func main() {
 	}
 	log.Printf("[sidecar] REST server listening on port %d", port)
 
+	// Phase 6: Sync pairing data to frontend
+	qrURL, textCode := server.GetPairingData()
+	ipc.Emit(ipc.EvtPairingData, ipc.PairingDataPayload{
+		QRURL:    qrURL,
+		TextCode: textCode,
+	})
+
 	router := ipc.NewRouter(discovery, sessions, server, server)
 
 	// Graceful shutdown

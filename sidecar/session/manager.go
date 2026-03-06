@@ -47,3 +47,11 @@ func (m *Manager) GetByToken(token string) (*Session, bool) {
 	}
 	return nil, false
 }
+
+func (m *Manager) Iterate(fn func(*Session)) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		fn(s)
+	}
+}

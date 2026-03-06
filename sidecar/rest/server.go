@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gestureshare/sidecar/clipboard"
 	"github.com/gestureshare/sidecar/ipc"
 	"github.com/gestureshare/sidecar/session"
 )
@@ -28,9 +29,13 @@ type Server struct {
 	sessions      *session.Manager
 	pendingOffers map[string]chan bool   // transferID -> decision
 	pendingPairs  map[string]chan string // peerID -> responderPubKey (or empty if rejected)
+	qrURL         string
+	textCode      string
 	mu            sync.Mutex
 	certPEM       []byte
 	certFP        string // SHA-256 fingerprint for TOFU
+	wsManager     *WSManager
+	clipboardSync *clipboard.ClipboardSync
 }
 
 func NewServer(sessions *session.Manager) *Server {
@@ -38,6 +43,7 @@ func NewServer(sessions *session.Manager) *Server {
 		sessions:      sessions,
 		pendingOffers: make(map[string]chan bool),
 		pendingPairs:  make(map[string]chan string),
+		wsManager:     NewWSManager(),
 	}
 }
 
@@ -64,6 +70,13 @@ func (s *Server) Start() (int, error) {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 
+	// Generate pairing data
+	sessionID := generateToken() // 32 chars hex
+	s.textCode = fmt.Sprintf("%06d", generateRandomInt(1000000))
+
+	ip, _ := getLocalIP()
+	s.qrURL = fmt.Sprintf("https://%s:%d/join#sid=%s&fp=%s", ip, port, sessionID, s.certFP)
+
 	s.httpServer = &http.Server{
 		Handler: mux,
 		TLSConfig: &tls.Config{
@@ -79,7 +92,29 @@ func (s *Server) Start() (int, error) {
 		}
 	}()
 
+	// Initialize Clipboard Sync
+	cs, err := clipboard.NewClipboardSync(func(text string) {
+		// On local clipboard change, push to all paired mobile clients
+		log.Printf("[Clipboard] Local change detected: %s", text)
+		// We'll push to all sessions for now. In a multi-device setup, we'd filter.
+		s.sessions.Iterate(func(sess *session.Session) {
+			if sess.IsPaired && sess.PeerID[:6] == "mobile" {
+				s.wsManager.PushMessage(sess.Token, "CLIPBOARD_RX", map[string]string{"text": text})
+			}
+		})
+	})
+	if err == nil {
+		s.clipboardSync = cs
+		go s.clipboardSync.Start(context.Background())
+	} else {
+		log.Printf("[rest] failed to init clipboard: %v", err)
+	}
+
 	return port, nil
+}
+
+func (s *Server) GetPairingData() (string, string) {
+	return s.qrURL, s.textCode
 }
 
 func (s *Server) Stop() {
@@ -96,7 +131,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/device/ping", s.handlePing)
 
 	// Pairing — no auth required (bootstraps the session)
+	mux.HandleFunc("GET /api/v1/pair/data", s.handleGetPairingData)
 	mux.HandleFunc("POST /api/v1/pair/request", s.handlePairRequest)
+	mux.HandleFunc("POST /api/v1/session/register", s.handleSessionRegister)
 	mux.HandleFunc("POST /api/v1/pair/accept", s.withAuth(s.handlePairAccept))
 	mux.HandleFunc("POST /api/v1/pair/reject", s.withAuth(s.handlePairReject))
 
@@ -105,9 +142,22 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/transfer/accept", s.withAuth(s.handleTransferAccept))
 	mux.HandleFunc("POST /api/v1/transfer/reject", s.withAuth(s.handleTransferReject))
 	mux.HandleFunc("POST /api/v1/transfer/cancel", s.withAuth(s.handleTransferCancel))
+
+	// Clipboard — auth required
+	mux.HandleFunc("POST /api/v1/clipboard/push", s.withAuth(s.handleClipboardPush))
+
+	// WebSocket — upgrades connection, auth via query param
+	mux.HandleFunc("GET /ws", s.handleWS)
 }
 
 // ── Handlers ─────────────────────────────────────────────────────
+
+func (s *Server) handleGetPairingData(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{
+		"qrUrl":    s.qrURL,
+		"textCode": s.textCode,
+	})
+}
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -124,6 +174,44 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 		"app":             "gestureshare",
 		"version":         "1.0.0",
 		"certFingerprint": s.certFP,
+	})
+}
+
+func (s *Server) handleSessionRegister(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PublicKey string `json:"publicKey"` // base64url-no-padding raw public key bytes
+		SessionID string `json:"sessionId"` // if from QR
+		Code      string `json:"code"`      // if from Text Code
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+
+	// Validate code if provided
+	if body.Code != "" && body.Code != s.textCode {
+		writeJSON(w, 403, map[string]string{"error": "INVALID_CODE"})
+		return
+	}
+
+	token := generateToken()
+	peerID := "mobile-" + generateToken()[:8]
+
+	s.sessions.Add(&session.Session{
+		PeerID:        peerID,
+		Token:         token,
+		TempPublicKey: body.PublicKey,
+		IsPaired:      true,
+	})
+
+	ipc.Emit(ipc.EvtPairSuccess, ipc.PairSuccessPayload{
+		PeerID:   peerID,
+		PeerName: "Mobile Client",
+	})
+
+	writeJSON(w, 200, map[string]string{
+		"token":       token,
+		"desktopName": "Desktop", // Should ideally be from deviceInfo
 	})
 }
 
@@ -274,6 +362,29 @@ func (s *Server) handleTransferCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
 }
 
+func (s *Server) handleClipboardPush(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid body"})
+		return
+	}
+
+	if s.clipboardSync != nil {
+		s.clipboardSync.Write(body.Text)
+	}
+
+	// Notify Tauri
+	ipc.Emit(ipc.EvtClipboardRx, map[string]string{"text": body.Text})
+
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	s.wsManager.HandleWS(w, r)
+}
+
 // ── Middleware ────────────────────────────────────────────────────
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -325,6 +436,36 @@ func generateSelfSignedCert() (certPEM, keyPEM []byte, fingerprint string, err e
 }
 
 // ── Utility ───────────────────────────────────────────────────────
+
+func generateRandomInt(max int) int {
+	b := make([]byte, 8)
+	rand.Read(b)
+	n := big.NewInt(0).SetBytes(b)
+	return int(n.Int64() % int64(max))
+}
+
+func getLocalIP() (string, error) {
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ip4 := ipnet.IP.To4(); ip4 != nil {
+					if !ip4.IsLinkLocalUnicast() {
+						return ip4.String(), nil
+					}
+				}
+			}
+		}
+	}
+	return "127.0.0.1", fmt.Errorf("no suitable network interface found")
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

@@ -19,11 +19,14 @@
     acceptPair,
     rejectPair,
   } from "$lib/transfer/tauribridge";
-  import type { AppScreen } from "$lib/types";
+  import type { AppScreen, ConnectionMethod, PairingData } from "$lib/types";
+  import QRCode from "qrcode";
+  import { listen } from "@tauri-apps/api/event";
 
   let videoEl: HTMLVideoElement;
   let phantomCanvas: HTMLCanvasElement;
   let orbCanvas: HTMLCanvasElement;
+  let qrCanvas: HTMLCanvasElement;
   let containerEl: HTMLDivElement;
 
   let tracker = new HandTracker();
@@ -32,6 +35,8 @@
   let fileOrb: FileOrb;
 
   let screen: AppScreen = "connect";
+  let connectionMethod: ConnectionMethod = "qr";
+  let pairingData: PairingData | null = null;
   let selectedFile: string | null = null;
   let selectedFileName = "";
   let selectedPeerId = "";
@@ -83,6 +88,23 @@
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
 
+  // -- Phase 6: Sync Pairing Data --
+  $: if (
+    screen === "connect" &&
+    activeMethod === "qr" &&
+    pairingData &&
+    qrCanvas
+  ) {
+    QRCode.toCanvas(qrCanvas, pairingData.qr_url, {
+      width: 256,
+      margin: 2,
+      color: {
+        dark: "#ffffff",
+        light: "#00000000",
+      },
+    });
+  }
+
   onMount(async () => {
     phantomHand = new PhantomHand(phantomCanvas);
     fileOrb = new FileOrb(orbCanvas);
@@ -90,6 +112,15 @@
 
     await tracker.initialize();
     await startDiscovery();
+
+    // Listen for mobile pairing data from sidecar
+    const unlistenPairingData = await listen<PairingData>(
+      "EVT_PAIRING_DATA",
+      (event) => {
+        console.log("[ui] Received pairing data:", event.payload);
+        pairingData = event.payload;
+      },
+    );
 
     requestDeviceInfo((info) => {
       deviceInfo = info;
@@ -111,6 +142,21 @@
 
     onPairRejected((res) => {
       transition("connect", { status: "Connection rejected" });
+    });
+
+    // -- Phase 7: Clipboard Sync Notification --
+    listen<{ text: string }>("EVT_CLIPBOARD_RX", (event) => {
+      const text = event.payload.text;
+      const snippet = text.length > 20 ? text.substring(0, 20) + "..." : text;
+      statusMessage = `Clipboard synced: "${snippet}"`;
+      // Clear message after 3 seconds if in ready state
+      if (screen === "ready") {
+        setTimeout(() => {
+          if (statusMessage.startsWith("Clipboard synced")) {
+            statusMessage = "Paired! Close fist to grab a file";
+          }
+        }, 3000);
+      }
     });
   });
 
@@ -312,14 +358,19 @@
         {:else if activeMethod === "qr"}
           <div class="placeholder-qr">
             <div class="qr-box">
-              <!-- QR generator would go here -->
-              <div class="qr-mock">QR</div>
+              {#if pairingData}
+                <canvas bind:this={qrCanvas}></canvas>
+              {:else}
+                <div class="spinner"></div>
+              {/if}
             </div>
             <p>Scan with GestureShare on mobile</p>
           </div>
         {:else if activeMethod === "code"}
           <div class="placeholder-code">
-            <div class="code-display">123 456</div>
+            <div class="code-display">
+              {pairingData?.text_code || "------"}
+            </div>
             <p>Enter this code on the other device</p>
           </div>
         {/if}

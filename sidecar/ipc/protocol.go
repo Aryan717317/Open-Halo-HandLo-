@@ -48,11 +48,13 @@ const (
 	EvtPairIncoming MsgType = "EVT_PAIR_INCOMING"
 	EvtPairSuccess  MsgType = "EVT_PAIR_SUCCESS"
 	EvtPairRejected MsgType = "EVT_PAIR_REJECTED"
+	EvtPairingData  MsgType = "EVT_PAIRING_DATA"
 	EvtTxOffer      MsgType = "EVT_TX_OFFER"
 	EvtTxProgress   MsgType = "EVT_TX_PROGRESS"
 	EvtTxComplete   MsgType = "EVT_TX_COMPLETE"
 	EvtTxCancelled  MsgType = "EVT_TX_CANCELLED"
 	EvtTxError      MsgType = "EVT_TX_ERROR"
+	EvtClipboardRx  MsgType = "EVT_CLIPBOARD_RX"
 	EvtError        MsgType = "EVT_ERROR"
 )
 
@@ -88,6 +90,16 @@ type PairRequestPayload struct {
 	Code           string `json:"code,omitempty"`
 	PublicKey      string `json:"public_key,omitempty"`
 	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+}
+
+type PairSuccessPayload struct {
+	PeerID   string `json:"peer_id"`
+	PeerName string `json:"peer_name"`
+}
+
+type PairingDataPayload struct {
+	QRURL    string `json:"qr_url"`
+	TextCode string `json:"text_code"`
 }
 
 type SendFilePayload struct {

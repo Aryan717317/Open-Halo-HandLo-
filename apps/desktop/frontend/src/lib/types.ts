@@ -37,3 +37,8 @@ export type AppScreen =
   | 'receiving'   // transfer in progress (receiver)
   | 'done'        // transfer complete
   | 'error';       // error state
+
+export interface PairingData {
+  qr_url: string;
+  text_code: string;
+}
