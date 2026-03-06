@@ -11,6 +11,14 @@ use serde_json::Value;
 pub fn spawn(app: AppHandle) {
     let app_clone = app.clone();
 
+    // Use a standard library MPSC channel since we're spawning standard threads
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    
+    // Store the sender in AppState
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        *state.sidecar_tx.lock().unwrap() = Some(tx);
+    }
+
     thread::spawn(move || {
         // In dev: run `go run .` from sidecar dir
         // In prod: Tauri bundles the compiled sidecar binary
@@ -24,6 +32,18 @@ pub fn spawn(app: AppHandle) {
             .expect("Failed to spawn Go sidecar. Is Go installed?");
 
         let stdout = child.stdout.take().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        // Spawn a separate thread to handle writing to stdin
+        thread::spawn(move || {
+            for msg in rx {
+                if let Err(e) = writeln!(stdin, "{}", msg) {
+                    log::error!("[sidecar writer error] {}", e);
+                    break;
+                }
+            }
+        });
+
         let reader = BufReader::new(stdout);
 
         // Read events from Go sidecar → forward to Svelte frontend
@@ -49,8 +69,16 @@ pub fn send_command(app: &AppHandle, cmd_type: &str, payload: Value) {
         "type": cmd_type,
         "payload": payload
     });
-    // In production: use the stored stdin handle
-    // For scaffold: commands are sent via stored child process stdin
+    
+    let msg_str = msg.to_string();
     log::debug!("[tauri→sidecar] {}", cmd_type);
-    let _ = msg; // TODO: wire up stdin writer in Phase 1
+    
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        let tx_guard = state.sidecar_tx.lock().unwrap();
+        if let Some(tx) = tx_guard.as_ref() {
+            let _ = tx.send(msg_str);
+        } else {
+            log::error!("Cannot send command to sidecar: stdin channel not initialized");
+        }
+    }
 }

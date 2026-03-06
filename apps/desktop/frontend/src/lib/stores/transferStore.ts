@@ -46,6 +46,23 @@ function createTransferStore() {
         return new Map(m);
       });
     },
+    startReceiving(offer: any) {
+      update((m) => {
+        m.set(offer.transfer_id, {
+          id: offer.transfer_id,
+          fileName: offer.file_name,
+          fileSize: offer.file_size,
+          peerId: offer.peer_id,
+          peerName: 'Remote Peer',
+          direction: 'receive',
+          status: 'active',
+          progress: 0,
+          speedBps: 0,
+          startedAt: Date.now(),
+        });
+        return new Map(m);
+      });
+    },
     error(id: string) {
       update((m) => {
         const t = m.get(id);

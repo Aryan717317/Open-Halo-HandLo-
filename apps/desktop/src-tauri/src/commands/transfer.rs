@@ -13,6 +13,16 @@ pub struct PairRequestArgs {
 }
 
 #[derive(Deserialize)]
+pub struct PairAcceptArgs {
+    peer_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct PairRejectArgs {
+    peer_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct SendFileArgs {
     transfer_id: String,
     peer_id: String,
@@ -47,6 +57,22 @@ pub async fn pair_request(app: AppHandle, args: PairRequestArgs) -> Result<(), S
 }
 
 #[tauri::command]
+pub async fn pair_accept(app: AppHandle, args: PairAcceptArgs) -> Result<(), String> {
+    sidecar::send_command(&app, "CMD_PAIR_ACCEPT", serde_json::json!({
+        "peer_id": args.peer_id,
+    }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pair_reject(app: AppHandle, args: PairRejectArgs) -> Result<(), String> {
+    sidecar::send_command(&app, "CMD_PAIR_REJECT", serde_json::json!({
+        "peer_id": args.peer_id,
+    }));
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn send_file(app: AppHandle, args: SendFileArgs) -> Result<(), String> {
     sidecar::send_command(&app, "CMD_SEND_FILE", serde_json::json!({
         "transfer_id": args.transfer_id,
@@ -62,6 +88,22 @@ pub async fn send_file(app: AppHandle, args: SendFileArgs) -> Result<(), String>
 #[tauri::command]
 pub async fn cancel_transfer(app: AppHandle, transfer_id: String) -> Result<(), String> {
     sidecar::send_command(&app, "CMD_CANCEL_TX", serde_json::json!({
+        "transfer_id": transfer_id
+    }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn accept_transfer(app: AppHandle, transfer_id: String) -> Result<(), String> {
+    sidecar::send_command(&app, "CMD_TX_ACCEPT", serde_json::json!({
+        "transfer_id": transfer_id
+    }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn reject_transfer(app: AppHandle, transfer_id: String) -> Result<(), String> {
+    sidecar::send_command(&app, "CMD_TX_REJECT", serde_json::json!({
         "transfer_id": transfer_id
     }));
     Ok(())

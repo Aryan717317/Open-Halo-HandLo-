@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -16,10 +17,10 @@ import (
 )
 
 const (
-	ServiceType    = "_gestureshare._tcp"
-	DefaultPort    = 47291
-	ScanInterval   = 3 * time.Second
-	ScanTimeout    = 2 * time.Second
+	ServiceType  = "_gestureshare._tcp"
+	DefaultPort  = 47291
+	ScanInterval = 3 * time.Second
+	ScanTimeout  = 2 * time.Second
 )
 
 type PeerInfo struct {
@@ -32,11 +33,12 @@ type PeerInfo struct {
 }
 
 type Discovery struct {
-	server   *mdns.Server
-	peers    map[string]*PeerInfo
-	mu       sync.RWMutex
-	stopCh   chan struct{}
-	peersCh  chan PeerInfo
+	server  *mdns.Server
+	peers   map[string]*PeerInfo
+	mu      sync.RWMutex
+	stopCh  chan struct{}
+	peersCh chan PeerInfo
+	lostCh  chan string
 }
 
 func NewDiscovery() *Discovery {
@@ -44,15 +46,16 @@ func NewDiscovery() *Discovery {
 		peers:   make(map[string]*PeerInfo),
 		stopCh:  make(chan struct{}),
 		peersCh: make(chan PeerInfo, 32),
+		lostCh:  make(chan string, 32),
 	}
 }
 
 // Start advertises this device and begins scanning for peers.
-// Returns a channel that emits newly found peers.
-func (d *Discovery) Start() <-chan PeerInfo {
+// Returns channels that emit newly found peers and lost peer IDs.
+func (d *Discovery) Start() (<-chan PeerInfo, <-chan string) {
 	go d.advertise()
 	go d.scanLoop()
-	return d.peersCh
+	return d.peersCh, d.lostCh
 }
 
 func (d *Discovery) Stop() {
@@ -77,8 +80,8 @@ func (d *Discovery) advertise() {
 	service, err := mdns.NewMDNSService(
 		deviceName,
 		ServiceType,
-		"",       // domain — default .local
-		"",       // host — auto
+		"", // domain — default .local
+		"", // host — auto
 		DefaultPort,
 		[]net.IP{},
 		info,
@@ -154,6 +157,14 @@ func (d *Discovery) scan() {
 	for id := range d.peers {
 		if !found[id] {
 			delete(d.peers, id)
+			log.Printf("[mdns] peer lost: %s", id)
+
+			// Non-blocking send in case the channel is full
+			select {
+			case d.lostCh <- id:
+			default:
+				log.Printf("[mdns] lostCh full, dropping peer %s", id)
+			}
 		}
 	}
 }
@@ -191,6 +202,5 @@ func extractField(fields []string, key string) string {
 }
 
 func getOS() string {
-	// runtime.GOOS returns "darwin", "windows", "linux"
-	return "desktop"
+	return runtime.GOOS
 }

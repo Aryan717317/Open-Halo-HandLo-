@@ -15,22 +15,27 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gestureshare/sidecar/ipc"
+	"github.com/gestureshare/sidecar/session"
 )
 
 // Server runs the local HTTPS REST API
 type Server struct {
-	httpServer  *http.Server
-	sessionKeys map[string]string // peerID → session token
-	certPEM     []byte
-	certFP      string // SHA-256 fingerprint for TOFU
+	httpServer    *http.Server
+	sessions      *session.Manager
+	pendingOffers map[string]chan bool // transferID -> decision
+	mu            sync.Mutex
+	certPEM       []byte
+	certFP        string // SHA-256 fingerprint for TOFU
 }
 
-func NewServer(discovery interface{}, rtcManager interface{}) *Server {
+func NewServer(sessions *session.Manager) *Server {
 	return &Server{
-		sessionKeys: make(map[string]string),
+		sessions:      sessions,
+		pendingOffers: make(map[string]chan bool),
 	}
 }
 
@@ -113,9 +118,9 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 		name = hostname[0]
 	}
 	writeJSON(w, 200, map[string]interface{}{
-		"name":        name,
-		"app":         "gestureshare",
-		"version":     "1.0.0",
+		"name":            name,
+		"app":             "gestureshare",
+		"version":         "1.0.0",
 		"certFingerprint": s.certFP,
 	})
 }
@@ -132,7 +137,7 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit to Tauri — let the UI decide to accept/reject
-	ipc.Emit(ipc.MsgPairRequest, ipc.PairRequestPayload{
+	ipc.Emit(ipc.EvtPairIncoming, ipc.PairRequestPayload{
 		PeerID:   body.PeerID,
 		PeerName: body.PeerName,
 		PeerAddr: r.RemoteAddr,
@@ -140,7 +145,10 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Issue a short-lived session token
 	token := generateToken()
-	s.sessionKeys[body.PeerID] = token
+	s.sessions.Add(&session.Session{
+		PeerID: body.PeerID,
+		Token:  token,
+	})
 
 	writeJSON(w, 200, map[string]string{
 		"status": "pending",
@@ -150,7 +158,7 @@ func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePairAccept(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "accepted"})
-	ipc.Emit(ipc.MsgPairComplete, map[string]string{"status": "accepted"})
+	ipc.Emit(ipc.EvtPairSuccess, map[string]string{"status": "accepted"})
 }
 
 func (s *Server) handlePairReject(w http.ResponseWriter, r *http.Request) {
@@ -163,9 +171,45 @@ func (s *Server) handleTransferOffer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid body"})
 		return
 	}
-	// Forward to Tauri — UI will prompt user to accept
-	ipc.Emit(ipc.MsgTransferOffer, offer)
-	writeJSON(w, 200, map[string]string{"status": "pending"})
+
+	ch := make(chan bool)
+	s.mu.Lock()
+	s.pendingOffers[offer.TransferID] = ch
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingOffers, offer.TransferID)
+		s.mu.Unlock()
+	}()
+
+	// Include sender IP from RemoteAddr
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	offer.SenderAddress = host
+
+	ipc.Emit(ipc.EvtTxOffer, offer)
+
+	select {
+	case accepted := <-ch:
+		if accepted {
+			writeJSON(w, 200, map[string]string{"status": "accepted"})
+		} else {
+			writeJSON(w, 200, map[string]string{"status": "rejected"})
+		}
+	case <-time.After(30 * time.Second):
+		writeJSON(w, 408, map[string]string{"error": "timeout"})
+	}
+}
+
+func (s *Server) ResolveOffer(transferID string, accepted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch, ok := s.pendingOffers[transferID]; ok {
+		select {
+		case ch <- accepted:
+		default:
+		}
+	}
 }
 
 func (s *Server) handleTransferAccept(w http.ResponseWriter, r *http.Request) {
@@ -174,21 +218,25 @@ func (s *Server) handleTransferAccept(w http.ResponseWriter, r *http.Request) {
 		ECDHPubKey string `json:"ecdhPubKey"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-	ipc.Emit(ipc.MsgTransferAccept, body)
+	ipc.Emit("EVT_TX_ACCEPT", body) // Placeholder event
 	writeJSON(w, 200, map[string]string{"status": "accepted"})
 }
 
 func (s *Server) handleTransferReject(w http.ResponseWriter, r *http.Request) {
-	var body struct{ TransferID string `json:"transferId"` }
+	var body struct {
+		TransferID string `json:"transferId"`
+	}
 	json.NewDecoder(r.Body).Decode(&body)
-	ipc.Emit(ipc.MsgTransferReject, body)
+	ipc.Emit("EVT_TX_REJECT", body) // Placeholder event
 	writeJSON(w, 200, map[string]string{"status": "rejected"})
 }
 
 func (s *Server) handleTransferCancel(w http.ResponseWriter, r *http.Request) {
-	var body struct{ TransferID string `json:"transferId"` }
+	var body struct {
+		TransferID string `json:"transferId"`
+	}
 	json.NewDecoder(r.Body).Decode(&body)
-	ipc.Emit(ipc.MsgTransferCancel, body)
+	ipc.Emit(ipc.EvtTxCancelled, body)
 	writeJSON(w, 200, map[string]string{"status": "cancelled"})
 }
 
@@ -197,14 +245,7 @@ func (s *Server) handleTransferCancel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-GestureShare-Token")
-		valid := false
-		for _, t := range s.sessionKeys {
-			if t == token {
-				valid = true
-				break
-			}
-		}
-		if !valid {
+		if _, ok := s.sessions.GetByToken(token); !ok {
 			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -265,5 +306,5 @@ func generateToken() string {
 
 // PairWith satisfies the PairingService interface used by the IPC router
 func (s *Server) PairWith(peerID, peerAddr string, peerPort int) error { return nil }
-func (s *Server) AcceptPair(peerID string) error                        { return nil }
-func (s *Server) RejectPair(peerID string) error                        { return nil }
+func (s *Server) AcceptPair(peerID string) error                       { return nil }
+func (s *Server) RejectPair(peerID string) error                       { return nil }

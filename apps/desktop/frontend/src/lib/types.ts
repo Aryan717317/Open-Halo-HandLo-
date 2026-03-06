@@ -19,10 +19,11 @@ export interface ProgressEvent {
 export interface TransferOffer {
   transfer_id: string;
   peer_id: string;
-  peer_name: string;
   file_name: string;
   file_size: number;
   mime_type: string;
+  tcp_port: number;
+  sender_address: string;
 }
 
 export type ConnectionMethod = 'qr' | 'code' | 'lan';
