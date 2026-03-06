@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/gestureshare/sidecar/crypto"
 	"github.com/gestureshare/sidecar/mdns"
 	"github.com/gestureshare/sidecar/session"
 	"github.com/gestureshare/sidecar/transfer"
@@ -127,19 +128,25 @@ type TransferService interface {
 	ResolveOffer(transferID string, accepted bool)
 }
 
+type PairingService interface {
+	ResolvePair(peerID string, responderPubKey string)
+}
+
 // Router dispatches incoming IPC messages to the correct handler.
 type Router struct {
 	discovery       *mdns.Discovery
 	sessions        *session.Manager
 	transferService TransferService
+	pairingService  PairingService
 }
 
 // NewRouter creates a new IPC router.
-func NewRouter(discovery *mdns.Discovery, sessions *session.Manager, ts TransferService) *Router {
+func NewRouter(discovery *mdns.Discovery, sessions *session.Manager, ts TransferService, ps PairingService) *Router {
 	return &Router{
 		discovery:       discovery,
 		sessions:        sessions,
 		transferService: ts,
+		pairingService:  ps,
 	}
 }
 
@@ -205,6 +212,7 @@ func (r *Router) handle(msg IPCMessage) {
 	case CmdTxAccept:
 		var p struct {
 			TransferID    string `json:"transfer_id"`
+			PeerID        string `json:"peer_id"`
 			SenderAddress string `json:"sender_address"`
 			TcpPort       int    `json:"tcp_port"`
 			SavePath      string `json:"save_path"`
@@ -213,12 +221,15 @@ func (r *Router) handle(msg IPCMessage) {
 		if err := json.Unmarshal(msg.Payload, &p); err == nil {
 			r.transferService.ResolveOffer(p.TransferID, true)
 
-			// Start Receiver
-			testKey := make([]byte, 32)
-			copy(testKey, "phase3_test_key_32_bytes_long!!!")
+			// Phase 4: Retrieve session keys for receiver
+			s, ok := r.sessions.Get(p.PeerID)
+			if !ok || !s.IsPaired {
+				emitError("SESSION_NA", fmt.Sprintf("no session for peer %s", p.PeerID))
+				return
+			}
 
 			go func() {
-				err := transfer.ReceiveFileTCP(p.SenderAddress, p.TcpPort, testKey, p.SavePath, func(received, total int64) {
+				err := transfer.ReceiveFileTCP(p.SenderAddress, p.TcpPort, s.EncryptionKey, p.SavePath, func(received, total int64) {
 					Emit(EvtTxProgress, ProgressPayload{
 						TransferID: p.TransferID,
 						BytesSent:  received,
@@ -290,17 +301,25 @@ func (r *Router) handlePairRequest(p PairRequestPayload) {
 		return
 	}
 
+	// Phase 4: Generate ECDH keypair for initiator
+	kp, err := crypto.NewKeyPair()
+	if err != nil {
+		emitError("CRYPTO_FAIL", fmt.Sprintf("failed to generate keypair: %v", err))
+		return
+	}
+
 	client := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout: 60 * time.Second, // Wait for user acceptance
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
 	body, _ := json.Marshal(map[string]string{
-		"peerId":   getDeviceName(),
-		"peerName": getDeviceName(),
-		"code":     p.Code,
+		"peerId":    getDeviceName(),
+		"peerName":  getDeviceName(),
+		"publicKey": kp.PublicKeyHex(),
+		"code":      p.Code,
 	})
 
 	url := fmt.Sprintf("https://%s:%d/api/v1/pair/request", target.Address, target.Port)
@@ -316,30 +335,91 @@ func (r *Router) handlePairRequest(p PairRequestPayload) {
 		return
 	}
 
-	log.Printf("[ipc] pair request to peer %s successful", p.PeerID)
+	var respBody struct {
+		Status    string `json:"status"`
+		Token     string `json:"token"`
+		PublicKey string `json:"publicKey"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		emitError("PAIR_RESPONSE_PARSE", fmt.Sprintf("bad response: %v", err))
+		return
+	}
+
+	// Derive shared keys
+	shared, err := kp.DeriveSharedSecret(respBody.PublicKey)
+	if err != nil {
+		emitError("DERIVE_SECRET_FAIL", fmt.Sprintf("derivation failed: %v", err))
+		return
+	}
+	encKey, hmacKey := crypto.DeriveSessionKeys(shared)
+
+	// Save session
+	r.sessions.Add(&session.Session{
+		PeerID:        p.PeerID,
+		Token:         respBody.Token,
+		EncryptionKey: encKey,
+		HMACKey:       hmacKey,
+		IsPaired:      true,
+	})
+
+	log.Printf("[ipc] pairing with peer %s successful and keys derived", p.PeerID)
 	Emit(EvtPairSuccess, map[string]string{"peer_id": p.PeerID, "peer_name": target.Name})
 }
 
 func (r *Router) handlePairAccept(peerID string) {
-	log.Printf("[ipc] pair accept for peer %s", peerID)
+	s, ok := r.sessions.Get(peerID)
+	if !ok {
+		emitError("PAIR_SESSION_NA", fmt.Sprintf("no session for peer %s", peerID))
+		return
+	}
+
+	// Phase 4: Generate responder's ECDH keypair
+	kp, err := crypto.NewKeyPair()
+	if err != nil {
+		emitError("CRYPTO_FAIL", fmt.Sprintf("failed to generate keypair: %v", err))
+		return
+	}
+
+	// Derive shared secret from initiator's public key
+	shared, err := kp.DeriveSharedSecret(s.TempPublicKey)
+	if err != nil {
+		emitError("DERIVE_SECRET_FAIL", fmt.Sprintf("derivation failed: %v", err))
+		return
+	}
+	encKey, hmacKey := crypto.DeriveSessionKeys(shared)
+
+	// Update session with derived keys
+	s.EncryptionKey = encKey
+	s.HMACKey = hmacKey
+	s.IsPaired = true
+	s.TempPublicKey = ""
+
+	// Signal the REST API to return our public key to the initiator
+	r.pairingService.ResolvePair(peerID, kp.PublicKeyHex())
+
+	log.Printf("[ipc] pair accept for peer %s - keys derived", peerID)
 	Emit(EvtPairSuccess, map[string]string{"peer_id": peerID})
 }
 
 func (r *Router) handlePairReject(peerID string) {
 	log.Printf("[ipc] pair reject for peer %s", peerID)
+	// Unblock REST API with empty key to signal rejection
+	r.pairingService.ResolvePair(peerID, "")
 	Emit(EvtPairRejected, map[string]string{"peer_id": peerID})
 }
 
 func (r *Router) handleSendFile(p SendFilePayload) {
 	log.Printf("[ipc] starting tcp transfer for %s to peer %s", p.FileName, p.PeerID)
 
-	// In a real app, we'd use the derived session key.
-	// For Phase 3, we'll use a test key (32 bytes).
-	testKey := make([]byte, 32)
-	copy(testKey, "phase3_test_key_32_bytes_long!!!")
+	// Phase 4: Retrieve session keys
+	s, ok := r.sessions.Get(p.PeerID)
+	if !ok || !s.IsPaired {
+		emitError("SESSION_NA", fmt.Sprintf("no paired session for peer %s", p.PeerID))
+		return
+	}
 
 	// 1. Start TCP Sender
-	port, err := transfer.SendFileTCP(p.FilePath, testKey, func(sent, total int64) {
+	port, err := transfer.SendFileTCP(p.FilePath, s.EncryptionKey, s.HMACKey, func(sent, total int64) {
 		Emit(EvtTxProgress, ProgressPayload{
 			TransferID: p.TransferID,
 			BytesSent:  sent,

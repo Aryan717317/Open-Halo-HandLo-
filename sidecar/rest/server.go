@@ -26,7 +26,8 @@ import (
 type Server struct {
 	httpServer    *http.Server
 	sessions      *session.Manager
-	pendingOffers map[string]chan bool // transferID -> decision
+	pendingOffers map[string]chan bool   // transferID -> decision
+	pendingPairs  map[string]chan string // peerID -> responderPubKey (or empty if rejected)
 	mu            sync.Mutex
 	certPEM       []byte
 	certFP        string // SHA-256 fingerprint for TOFU
@@ -36,6 +37,7 @@ func NewServer(sessions *session.Manager) *Server {
 	return &Server{
 		sessions:      sessions,
 		pendingOffers: make(map[string]chan bool),
+		pendingPairs:  make(map[string]chan string),
 	}
 }
 
@@ -127,38 +129,70 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePairRequest(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		PeerID   string `json:"peerId"`
-		PeerName string `json:"peerName"`
-		Code     string `json:"code,omitempty"` // optional 6-digit code
+		PeerID    string `json:"peerId"`
+		PeerName  string `json:"peerName"`
+		PublicKey string `json:"publicKey"`
+		Code      string `json:"code,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid body"})
 		return
 	}
 
-	// Emit to Tauri — let the UI decide to accept/reject
+	ch := make(chan string)
+	s.mu.Lock()
+	s.pendingPairs[body.PeerID] = ch
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingPairs, body.PeerID)
+		s.mu.Unlock()
+	}()
+
+	token := generateToken()
+	s.sessions.Add(&session.Session{
+		PeerID:        body.PeerID,
+		Token:         token,
+		TempPublicKey: body.PublicKey,
+	})
+
 	ipc.Emit(ipc.EvtPairIncoming, ipc.PairRequestPayload{
 		PeerID:   body.PeerID,
 		PeerName: body.PeerName,
 		PeerAddr: r.RemoteAddr,
 	})
 
-	// Issue a short-lived session token
-	token := generateToken()
-	s.sessions.Add(&session.Session{
-		PeerID: body.PeerID,
-		Token:  token,
-	})
+	select {
+	case responderPubKey := <-ch:
+		if responderPubKey != "" {
+			writeJSON(w, 200, map[string]string{
+				"status":    "accepted",
+				"token":     token,
+				"publicKey": responderPubKey,
+			})
+		} else {
+			writeJSON(w, 403, map[string]string{"status": "rejected"})
+		}
+	case <-time.After(60 * time.Second):
+		writeJSON(w, 408, map[string]string{"error": "timeout"})
+	}
+}
 
-	writeJSON(w, 200, map[string]string{
-		"status": "pending",
-		"token":  token,
-	})
+func (s *Server) ResolvePair(peerID string, responderPubKey string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch, ok := s.pendingPairs[peerID]; ok {
+		select {
+		case ch <- responderPubKey:
+		default:
+		}
+	}
 }
 
 func (s *Server) handlePairAccept(w http.ResponseWriter, r *http.Request) {
+	// Not used by initiator in blocking flow, but keep for legacy or explicit confirmation
 	writeJSON(w, 200, map[string]string{"status": "accepted"})
-	ipc.Emit(ipc.EvtPairSuccess, map[string]string{"status": "accepted"})
 }
 
 func (s *Server) handlePairReject(w http.ResponseWriter, r *http.Request) {

@@ -2,10 +2,12 @@
 package crypto
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -28,7 +30,7 @@ func NewKeyPair() (*KeyPair, error) {
 	return &KeyPair{PrivateKey: priv, PublicKey: pub}, nil
 }
 
-// DeriveSharedSecret performs ECDH and hashes result to produce AES-256 key
+// DeriveSharedSecret performs ECDH and returns the raw 32-byte shared secret
 func (kp *KeyPair) DeriveSharedSecret(theirPublicKeyHex string) ([]byte, error) {
 	theirPubBytes, err := hex.DecodeString(theirPublicKeyHex)
 	if err != nil {
@@ -41,8 +43,20 @@ func (kp *KeyPair) DeriveSharedSecret(theirPublicKeyHex string) ([]byte, error) 
 	copy(theirPub[:], theirPubBytes)
 	var shared [32]byte
 	curve25519.ScalarMult(&shared, &kp.PrivateKey, &theirPub)
-	key := sha256.Sum256(shared[:])
-	return key[:], nil
+	return shared[:], nil
+}
+
+// DeriveSessionKeys splits the shared secret into encryption and HMAC keys
+func DeriveSessionKeys(sharedSecret []byte) (encKey, hmacKey []byte) {
+	// Simple HKDF-Expand style derivation
+	h := hmac.New(sha256.New, sharedSecret)
+	h.Write([]byte("AES-256-CTR"))
+	encKey = h.Sum(nil)
+
+	h.Reset()
+	h.Write([]byte("HMAC-SHA256"))
+	hmacKey = h.Sum(nil)
+	return
 }
 
 func (kp *KeyPair) PublicKeyHex() string {

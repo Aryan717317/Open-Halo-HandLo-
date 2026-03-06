@@ -27,7 +27,7 @@ func main() {
 	}
 	log.Printf("[sidecar] REST server listening on port %d", port)
 
-	router := ipc.NewRouter(discovery, sessions, server)
+	router := ipc.NewRouter(discovery, sessions, server, server)
 
 	// Graceful shutdown
 	sig := make(chan os.Signal, 1)

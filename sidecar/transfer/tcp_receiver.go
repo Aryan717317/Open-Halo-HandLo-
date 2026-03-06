@@ -14,7 +14,7 @@ import (
 )
 
 // ReceiveFileTCP connects to a TCP sender securely and writes the decrypted stream to disk.
-func ReceiveFileTCP(address string, port int, key []byte, outPath string, onProgress func(sent, total int64), totalSize int64) error {
+func ReceiveFileTCP(address string, port int, encKey, hmacKey []byte, outPath string, onProgress func(sent, total int64), totalSize int64) error {
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", address, port))
 	if err != nil {
 		return fmt.Errorf("dial tcp: %w", err)
@@ -50,7 +50,7 @@ func ReceiveFileTCP(address string, port int, key []byte, outPath string, onProg
 		counter := payload[:16]
 		if isEOF(counter) {
 			hmacSig := payload[16:] // HMAC is what follows the EOF counter
-			if !crypto.VerifyHMAC(allCiphertext, hmacSig, key) {
+			if !crypto.VerifyHMAC(allCiphertext, hmacSig, hmacKey) {
 				os.Remove(outPath)
 				return fmt.Errorf("HMAC verification failed")
 			}
@@ -59,7 +59,7 @@ func ReceiveFileTCP(address string, port int, key []byte, outPath string, onProg
 
 		ciphertext := payload[16:]
 
-		plaintext, dErr := crypto.EncryptCTR(ciphertext, key, counter)
+		plaintext, dErr := crypto.EncryptCTR(ciphertext, encKey, counter)
 		if dErr != nil {
 			return fmt.Errorf("decrypt: %w", dErr)
 		}

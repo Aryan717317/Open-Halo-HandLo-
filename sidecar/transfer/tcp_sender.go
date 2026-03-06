@@ -15,7 +15,7 @@ import (
 
 // SendFileTCP opens a TCP server on a random port, returns the port.
 // When a client connects, it encrypts the file via CTR and sends it via TCP.
-func SendFileTCP(filePath string, key []byte, onProgress func(sent, total int64)) (int, error) {
+func SendFileTCP(filePath string, encKey, hmacKey []byte, onProgress func(sent, total int64)) (int, error) {
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		return 0, fmt.Errorf("tcp listen: %w", err)
@@ -34,7 +34,7 @@ func SendFileTCP(filePath string, key []byte, onProgress func(sent, total int64)
 		defer conn.Close()
 		log.Printf("[tcp_sender] accepted connection from %s", conn.RemoteAddr())
 
-		if err := sendTCP(conn, filePath, key, onProgress); err != nil {
+		if err := sendTCP(conn, filePath, encKey, hmacKey, onProgress); err != nil {
 			log.Printf("[tcp_sender] send error: %v", err)
 		}
 	}()
@@ -42,7 +42,7 @@ func SendFileTCP(filePath string, key []byte, onProgress func(sent, total int64)
 	return port, nil
 }
 
-func sendTCP(conn net.Conn, filePath string, key []byte, onProgress func(sent, total int64)) error {
+func sendTCP(conn net.Conn, filePath string, encKey, hmacKey []byte, onProgress func(sent, total int64)) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
@@ -66,7 +66,7 @@ func sendTCP(conn net.Conn, filePath string, key []byte, onProgress func(sent, t
 				return fmt.Errorf("generate counter: %w", errGenerate)
 			}
 
-			ciphertext, cErr := crypto.EncryptCTR(plaintext, key, counter)
+			ciphertext, cErr := crypto.EncryptCTR(plaintext, encKey, counter)
 			if cErr != nil {
 				return fmt.Errorf("encrypt: %w", cErr)
 			}
@@ -99,7 +99,7 @@ func sendTCP(conn net.Conn, filePath string, key []byte, onProgress func(sent, t
 	}
 
 	// EOF Packet
-	hmacSig := crypto.ComputeHMAC(allCiphertext, key)
+	hmacSig := crypto.ComputeHMAC(allCiphertext, hmacKey)
 	eofHeader := make([]byte, 20)
 	binary.BigEndian.PutUint32(eofHeader[0:4], 36) // 16 counter + 32 hmac
 	for i := 4; i < 20; i++ {

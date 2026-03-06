@@ -5,9 +5,12 @@ import (
 )
 
 type Session struct {
-	PeerID    string
-	SharedKey []byte
-	Token     string
+	PeerID        string
+	EncryptionKey []byte
+	HMACKey       []byte
+	Token         string
+	IsPaired      bool
+	TempPublicKey string // Initiator's public key during handshake
 }
 
 type Manager struct {

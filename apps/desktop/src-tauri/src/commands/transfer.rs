@@ -94,10 +94,27 @@ pub async fn cancel_transfer(app: AppHandle, transfer_id: String) -> Result<(), 
 }
 
 #[tauri::command]
-pub async fn accept_transfer(app: AppHandle, transfer_id: String) -> Result<(), String> {
-    sidecar::send_command(&app, "CMD_TX_ACCEPT", serde_json::json!({
-        "transfer_id": transfer_id
-    }));
+pub async fn accept_transfer(
+    app: AppHandle,
+    transfer_id: String,
+    peer_id: String,
+    sender_address: String,
+    tcp_port: u16,
+    save_path: String,
+    file_size: u64,
+) -> Result<(), String> {
+    sidecar::send_command(
+        &app,
+        "CMD_TX_ACCEPT",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "peer_id": peer_id,
+            "sender_address": sender_address,
+            "tcp_port": tcp_port,
+            "save_path": save_path,
+            "file_size": file_size,
+        }),
+    );
     Ok(())
 }
 

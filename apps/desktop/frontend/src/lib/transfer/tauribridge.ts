@@ -95,6 +95,7 @@ export async function cancelTransfer(transferId: string): Promise<void> {
 export async function acceptTransfer(offer: TransferOffer, savePath: string): Promise<void> {
   await invoke('accept_transfer', {
     transferId: offer.transfer_id,
+    peerId: offer.peer_id,
     senderAddress: offer.sender_address,
     tcpPort: offer.tcp_port,
     savePath: savePath,
