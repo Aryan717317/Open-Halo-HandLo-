@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+target/
+build/
+
+# Go
+sidecar/sidecar
+sidecar/sidecar.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# SvelteKit
+apps/desktop/frontend/.svelte-kit/
+apps/desktop/frontend/build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temp
+tmp/
+*.tmp
