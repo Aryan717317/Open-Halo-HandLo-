@@ -35,9 +35,51 @@
   let selectedFile: string | null = null;
   let selectedFileName = "";
   let selectedPeerId = "";
-  let statusMessage = "Show your hand to the camera";
+  let statusMessage = "Connect a device to begin";
   let deviceInfo: any = null;
   let incomingPairRequest: any = null;
+  let errorDetails: {
+    code: string;
+    message: string;
+    isSecurity: boolean;
+  } | null = null;
+
+  // ── State Machine ───────────────────────────────────────────────────────────
+
+  async function transition(to: AppScreen, context: any = {}) {
+    const prevScreen = screen;
+
+    // INV-01: Camera management
+    const cameraScreens: AppScreen[] = [
+      "ready",
+      "selecting",
+      "sending",
+      "receiving",
+    ];
+    const shouldHaveCamera = cameraScreens.includes(to);
+    const hadCamera = cameraScreens.includes(prevScreen);
+
+    if (shouldHaveCamera && !hadCamera) {
+      await tracker.startCamera(videoEl, handleFrame);
+    } else if (!shouldHaveCamera && hadCamera) {
+      tracker.stop();
+    }
+
+    // INV-09: Clear file when returning to ready
+    if (to === "ready") {
+      selectedFile = null;
+      selectedFileName = "";
+      fileOrb?.detach();
+    }
+
+    // Handle context
+    if (context.peerId) selectedPeerId = context.peerId;
+    if (context.status) statusMessage = context.status;
+    if (context.error) errorDetails = context.error;
+
+    screen = to;
+    console.log(`[state] transition: ${prevScreen} -> ${to}`);
+  }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -47,7 +89,6 @@
     resize();
 
     await tracker.initialize();
-    await tracker.startCamera(videoEl, handleFrame);
     await startDiscovery();
 
     requestDeviceInfo((info) => {
@@ -56,23 +97,21 @@
 
     onIncomingPair((req) => {
       incomingPairRequest = req;
-      screen = "pairing";
-      statusMessage = `Incoming connection from ${req.peer_name}`;
+      transition("pairing", {
+        status: `Incoming connection from ${req.peer_name}`,
+      });
     });
 
     onPairSuccess((res) => {
-      selectedPeerId = res.peer_id;
-      screen = "ready";
-      statusMessage = "Paired! Close fist to grab a file";
+      transition("ready", {
+        peerId: res.peer_id,
+        status: "Paired! Close fist to grab a file",
+      });
     });
 
     onPairRejected((res) => {
-      statusMessage = "Connection rejected";
-      screen = "connect";
-      selectedPeerId = "";
+      transition("connect", { status: "Connection rejected" });
     });
-
-    screen = "connect";
   });
 
   onDestroy(() => {
@@ -105,10 +144,15 @@
       handVisible: landmarks.length > 0,
     });
 
-    phantomHand?.update(landmarks, gesture);
+    // Update visuals based on state
+    if (screen === "selecting") {
+      phantomHand?.update(landmarks, gesture, "orange");
+    } else {
+      phantomHand?.update(landmarks, gesture, "cyan");
+    }
+
     fileOrb?.tick(landmarks[0]);
 
-    // ── Gesture → action mapping ───────────────────────────────────────────────
     if (gesture !== prevGesture) {
       onGestureChange(gesture, landmarks);
       prevGesture = gesture;
@@ -118,12 +162,10 @@
   async function onGestureChange(gesture: Gesture, landmarks: any[]) {
     if (screen === "ready") {
       if (gesture === Gesture.GRAB) {
-        // Closed fist → open file picker
         await handleGrab(landmarks[0]);
       }
     } else if (screen === "selecting" && selectedFile) {
       if (gesture === Gesture.OPEN_PALM) {
-        // Open palm → send file to selected peer
         handleSend();
       }
     }
@@ -133,59 +175,61 @@
     statusMessage = "Opening file picker...";
     const path = await pickFile();
     if (!path) {
-      screen = "ready";
+      transition("ready");
       return;
     }
 
     selectedFile = path;
     selectedFileName =
       path.split("/").pop() ?? path.split("\\").pop() ?? "file";
-    screen = "selecting";
-    statusMessage = `"${selectedFileName}" selected — open palm to send`;
+
+    transition("selecting", {
+      status: `"${selectedFileName}" selected — open palm to send`,
+    });
     fileOrb?.attach(palmLandmark, selectedFileName);
   }
 
   async function handleSend() {
     if (!selectedFile || !selectedPeerId) return;
-    screen = "sending";
-    statusMessage = "Sending...";
+
+    transition("sending", { status: "Sending..." });
     fileOrb?.startSend();
 
     try {
       await sendFile(selectedFile, selectedPeerId, selectedFileName, 0);
-      statusMessage = "Sent!";
+      transition("done", { status: "Sent!" });
       fileOrb?.complete();
-      setTimeout(() => {
-        screen = "ready";
-        selectedFile = null;
-      }, 2000);
-    } catch (e) {
-      statusMessage = "Transfer failed";
-      screen = "ready";
+    } catch (e: any) {
+      transition("error", {
+        error: {
+          code: "TX_FAIL",
+          message: e.message || "Transfer failed",
+          isSecurity: false,
+        },
+      });
     }
   }
 
   function selectPeer(peer: any) {
-    statusMessage = `Connecting to ${peer.name}...`;
+    transition("pairing", { status: `Connecting to ${peer.name}...` });
     pairWithPeer(peer.id, peer.name);
   }
 
   function handleAcceptPair() {
     if (!incomingPairRequest) return;
     acceptPair(incomingPairRequest.peer_id);
-    selectedPeerId = incomingPairRequest.peer_id;
     incomingPairRequest = null;
-    screen = "ready";
-    statusMessage = "Paired! Close fist to grab a file";
+    // Note: onPairSuccess will trigger the transition to 'ready'
   }
 
   function handleRejectPair() {
     if (!incomingPairRequest) return;
     rejectPair(incomingPairRequest.peer_id);
     incomingPairRequest = null;
-    screen = "connect";
-    statusMessage = "Connection rejected";
+    transition("connect", { status: "Connection rejected" });
   }
+
+  let activeMethod: "qr" | "code" | "lan" = "lan";
 </script>
 
 <svelte:window on:resize={resize} />
@@ -211,7 +255,7 @@
       <span class="status-text">{statusMessage}</span>
     </header>
 
-    <!-- Connection panel (shown until paired) -->
+    <!-- 1. CONNECT SCREEN -->
     {#if screen === "connect"}
       <div class="panel connect-panel">
         <h2>Connect a device</h2>
@@ -224,53 +268,87 @@
         {/if}
 
         <div class="connect-methods">
-          <button class="method-btn">
+          <button
+            class="method-btn"
+            class:active={activeMethod === "qr"}
+            on:click={() => (activeMethod = "qr")}
+          >
             <span class="icon">⊞</span>
             <span>QR Code</span>
           </button>
-          <button class="method-btn">
+          <button
+            class="method-btn"
+            class:active={activeMethod === "code"}
+            on:click={() => (activeMethod = "code")}
+          >
             <span class="icon">#</span>
             <span>Text Code</span>
           </button>
-          <button class="method-btn" class:active={$hasPeers}>
+          <button
+            class="method-btn"
+            class:active={activeMethod === "lan"}
+            on:click={() => (activeMethod = "lan")}
+          >
             <span class="icon">◈</span>
             <span>Nearby ({$peers.length})</span>
           </button>
         </div>
 
-        {#if $hasPeers}
-          <ul class="peer-list">
-            {#each $peers as peer}
-              <li>
-                <button class="peer-btn" on:click={() => selectPeer(peer)}>
-                  <span class="peer-name">{peer.name}</span>
-                  <span class="peer-meta">{peer.os} · {peer.address}</span>
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="scanning">Scanning local network...</p>
+        {#if activeMethod === "lan"}
+          {#if $hasPeers}
+            <ul class="peer-list">
+              {#each $peers as peer}
+                <li>
+                  <button class="peer-btn" on:click={() => selectPeer(peer)}>
+                    <span class="peer-name">{peer.name}</span>
+                    <span class="peer-meta">{peer.os} · {peer.address}</span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <p class="scanning">Scanning local network...</p>
+          {/if}
+        {:else if activeMethod === "qr"}
+          <div class="placeholder-qr">
+            <div class="qr-box">
+              <!-- QR generator would go here -->
+              <div class="qr-mock">QR</div>
+            </div>
+            <p>Scan with GestureShare on mobile</p>
+          </div>
+        {:else if activeMethod === "code"}
+          <div class="placeholder-code">
+            <div class="code-display">123 456</div>
+            <p>Enter this code on the other device</p>
+          </div>
         {/if}
       </div>
     {/if}
 
-    <!-- Pairing Dialog -->
-    {#if screen === "pairing" && incomingPairRequest}
-      <div class="panel connect-panel">
-        <h2>Incoming Connection</h2>
-        <div class="incoming-req">
-          <div class="peer-name">{incomingPairRequest.peer_name}</div>
-          <div class="peer-ip">{incomingPairRequest.address}</div>
+    <!-- 2. PAIRING SCREEN -->
+    {#if screen === "pairing"}
+      <div class="panel pairing-panel">
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
         </div>
-        <div class="actions">
-          <button class="btn accept" on:click={handleAcceptPair}>Accept</button>
-          <button class="btn reject" on:click={handleRejectPair}>Reject</button>
-        </div>
+        <h2>Pairing...</h2>
+        <p class="pairing-status">{statusMessage}</p>
+
+        {#if incomingPairRequest}
+          <div class="actions">
+            <button class="btn accept" on:click={handleAcceptPair}
+              >Accept</button
+            >
+            <button class="btn reject" on:click={handleRejectPair}
+              >Reject</button
+            >
+          </div>
+        {/if}
       </div>
     {/if}
 
-    <!-- Gesture hint -->
+    <!-- 3. READY / SELECTING / SENDING PROGRESS -->
     {#if screen === "ready" || screen === "selecting"}
       <div class="gesture-hint">
         {#if screen === "ready"}
@@ -283,22 +361,214 @@
       </div>
     {/if}
 
-    <!-- Transfer progress -->
-    {#each [...$transferStore] as [id, tx]}
-      {#if tx.status === "active"}
-        <div class="progress-bar-wrap">
-          <div class="progress-label">{tx.fileName}</div>
-          <div class="progress-track">
-            <div class="progress-fill" style="width: {tx.progress}%" />
+    {#if screen === "sending" || screen === "receiving"}
+      <div class="transfer-panel">
+        <div class="progress-ring-container">
+          <!-- Simplified progress ring for now -->
+          <svg class="progress-ring" width="120" height="120">
+            <circle class="ring-bg" cx="60" cy="60" r="54" />
+            <circle
+              class="ring-fill"
+              cx="60"
+              cy="60"
+              r="54"
+              style="stroke-dasharray: 339; stroke-dashoffset: {339 *
+                (1 -
+                  ($transferStore.get(selectedPeerId)?.progress || 0) / 100)}"
+            />
+          </svg>
+          <div class="pct-text">
+            {($transferStore.get(selectedPeerId)?.progress || 0).toFixed(0)}%
           </div>
-          <div class="progress-pct">{tx.progress.toFixed(0)}%</div>
         </div>
-      {/if}
-    {/each}
+        <p class="tx-info">
+          {screen === "sending" ? "Sending" : "Receiving"} file...
+        </p>
+      </div>
+    {/if}
+
+    <!-- 4. DONE SCREEN -->
+    {#if screen === "done"}
+      <div class="panel done-panel">
+        <div class="done-icon">✦</div>
+        <h2>Transfer Complete</h2>
+        <p>Keys wiped from memory. Session remains active.</p>
+        <button class="btn primary" on:click={() => transition("ready")}
+          >Send another file</button
+        >
+      </div>
+    {/if}
+
+    <!-- 5. ERROR SCREEN -->
+    {#if screen === "error" && errorDetails}
+      <div class="panel error-panel" class:security={errorDetails.isSecurity}>
+        <div class="error-icon">{errorDetails.isSecurity ? "⊘" : "!"}</div>
+        <h2>{errorDetails.isSecurity ? "Security Alert" : "Oops!"}</h2>
+        <p>{errorDetails.message}</p>
+
+        <div class="actions">
+          {#if errorDetails.isSecurity}
+            <button class="btn reject" on:click={() => transition("connect")}
+              >Scan QR Again</button
+            >
+          {:else}
+            <button class="btn primary" on:click={() => transition("ready")}
+              >Try Again</button
+            >
+            <button class="btn reject" on:click={() => transition("connect")}
+              >Disconnect</button
+            >
+          {/if}
+        </div>
+      </div>
+    {/if}
   </div>
 </div>
 
 <style>
+  /* Connection Placeholders */
+  .placeholder-qr,
+  .placeholder-code {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    padding: 40px 0;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 14px;
+  }
+  .qr-box {
+    width: 200px;
+    height: 200px;
+    background: #fff;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .qr-mock {
+    color: #000;
+    font-weight: 800;
+    font-size: 40px;
+  }
+  .code-display {
+    font-size: 48px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: #00d4ff;
+    text-shadow: 0 0 20px rgba(0, 212, 255, 0.4);
+  }
+
+  /* Pairing Spinner */
+  .spinner-wrap {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 24px;
+  }
+  .spinner {
+    width: 50px;
+    height: 50px;
+    border: 3px solid rgba(0, 212, 255, 0.1);
+    border-top-color: #00d4ff;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .pairing-status {
+    text-align: center;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.5);
+    margin-bottom: 24px;
+  }
+
+  /* Transfer Panel & Ring */
+  .transfer-panel {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(5px);
+    pointer-events: none;
+  }
+  .progress-ring-container {
+    position: relative;
+    width: 120px;
+    height: 120px;
+    margin-bottom: 20px;
+  }
+  .progress-ring circle {
+    fill: transparent;
+    stroke-width: 6;
+    transform: rotate(-90deg);
+    transform-origin: 50% 50%;
+  }
+  .ring-bg {
+    stroke: rgba(255, 255, 255, 0.1);
+  }
+  .ring-fill {
+    stroke: #00d4ff;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.3s ease;
+  }
+  .pct-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    font-weight: 600;
+    color: #fff;
+  }
+  .tx-info {
+    font-size: 16px;
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  /* Done & Error Panels */
+  .done-panel,
+  .error-panel {
+    text-align: center;
+  }
+  .done-icon,
+  .error-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+  }
+  .done-icon {
+    color: #39ff14;
+  }
+  .error-icon {
+    color: #ff3b30;
+  }
+  .error-panel.security {
+    border-color: rgba(255, 59, 48, 0.4);
+    background: rgba(40, 0, 0, 0.85);
+  }
+  .error-panel h2 {
+    color: #fff;
+  }
+  .error-panel p {
+    color: rgba(255, 255, 255, 0.6);
+    margin-bottom: 24px;
+    font-size: 14px;
+  }
+
+  .primary {
+    background: #00d4ff;
+    color: #000;
+    margin-bottom: 8px;
+  }
+
+  /* Original styles below */
   :global(*, *::before, *::after) {
     box-sizing: border-box;
     margin: 0;

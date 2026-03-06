@@ -8,19 +8,19 @@ import { Gesture } from '$lib/gesture/GestureClassifier';
 
 // Anatomical bone connections between the 21 MediaPipe landmarks
 const CONNECTIONS = [
-  [0,1],[1,2],[2,3],[3,4],           // Thumb
-  [0,5],[5,6],[6,7],[7,8],           // Index
-  [0,9],[9,10],[10,11],[11,12],      // Middle
-  [0,13],[13,14],[14,15],[15,16],    // Ring
-  [0,17],[17,18],[18,19],[19,20],    // Pinky
-  [5,9],[9,13],[13,17],              // Palm cross-connections
+  [0, 1], [1, 2], [2, 3], [3, 4],           // Thumb
+  [0, 5], [5, 6], [6, 7], [7, 8],           // Index
+  [0, 9], [9, 10], [10, 11], [11, 12],      // Middle
+  [0, 13], [13, 14], [14, 15], [15, 16],    // Ring
+  [0, 17], [17, 18], [18, 19], [19, 20],    // Pinky
+  [5, 9], [9, 13], [13, 17],              // Palm cross-connections
 ];
 
 const COLORS = {
-  idle:      0x00d4ff,   // cyan
-  grab:      0xff6b35,   // orange — grab/select
-  openPalm:  0x39ff14,   // neon green — send/accept
-  point:     0xffd700,   // gold — navigate
+  idle: 0x00d4ff,   // cyan
+  grab: 0xff6b35,   // orange — grab/select
+  openPalm: 0x39ff14,   // neon green — send/accept
+  point: 0xffd700,   // gold — navigate
 };
 
 export class PhantomHand {
@@ -46,15 +46,19 @@ export class PhantomHand {
     this.renderer.setSize(width, height);
   }
 
-  update(landmarks: NormalizedLandmark[], gesture: Gesture) {
+  update(landmarks: NormalizedLandmark[], gesture: Gesture, colorOverride?: string) {
     this.scene.clear();
     this.bones = [];
     this.joints = [];
 
     if (landmarks.length === 0) return;
 
-    const color = this.gestureColor(gesture);
-    const glowOpacity = gesture === Gesture.GRAB ? 0.6 : 0.35;
+    let color = this.gestureColor(gesture);
+    if (colorOverride === "orange") color = COLORS.grab;
+    if (colorOverride === "cyan") color = COLORS.idle;
+    if (colorOverride === "green") color = COLORS.openPalm;
+
+    const glowOpacity = gesture === Gesture.GRAB || colorOverride === "orange" ? 0.6 : 0.35;
 
     // Draw bones
     const boneMat = new THREE.LineBasicMaterial({
@@ -109,10 +113,10 @@ export class PhantomHand {
 
   private gestureColor(g: Gesture): number {
     switch (g) {
-      case Gesture.GRAB:      return COLORS.grab;
+      case Gesture.GRAB: return COLORS.grab;
       case Gesture.OPEN_PALM: return COLORS.openPalm;
-      case Gesture.POINT:     return COLORS.point;
-      default:                return COLORS.idle;
+      case Gesture.POINT: return COLORS.point;
+      default: return COLORS.idle;
     }
   }
 

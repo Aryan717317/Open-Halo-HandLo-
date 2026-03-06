@@ -34,4 +34,6 @@ export type AppScreen =
   | 'ready'       // paired, gesture camera active
   | 'selecting'   // grab detected, file picker open
   | 'sending'     // transfer in progress (sender)
-  | 'receiving';  // transfer in progress (receiver)
+  | 'receiving'   // transfer in progress (receiver)
+  | 'done'        // transfer complete
+  | 'error';       // error state

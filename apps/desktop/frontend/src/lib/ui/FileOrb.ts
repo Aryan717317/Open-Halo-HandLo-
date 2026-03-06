@@ -111,6 +111,10 @@ export class FileOrb {
   get currentState(): OrbState { return this.state; }
   get currentFileName(): string { return this.fileName; }
 
+  detach() {
+    this.hide();
+  }
+
   dispose() {
     this.renderer.dispose();
   }
